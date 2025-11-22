@@ -307,28 +307,41 @@ def get_llm(temperature):
 # ============================================================================
 # AI QUESTION GENERATION
 # ============================================================================
-
-@st.cache_data(ttl=3600)  # Cache for 1 hour
-def generate_suggested_questions(_vectorstore, num_questions=5):
+@st.cache_data(ttl=3600)
+def generate_suggested_questions(_vectorstore, num_questions=5, current_documents=None):
     """
-    Generate intelligent question suggestions based on document content.
-    Uses GPT-4 to analyze document chunks and create relevant questions.
+    Generate questions ONLY from currently uploaded documents.
     
     Args:
-        _vectorstore: FAISS vector store containing document embeddings
-        num_questions (int): Number of questions to generate (default: 5)
-    
-    Returns:
-        list: List of suggested question strings
+        _vectorstore: FAISS vector store
+        num_questions (int): Number of questions to generate
+        current_documents (list): List of document names uploaded in current session
     """
     try:
-        # Retrieve diverse document chunks
-        docs = _vectorstore.similarity_search("main topics concepts key ideas", k=10)
+        # Get documents from vectorstore
+        docs = _vectorstore.similarity_search("main topics concepts key ideas", k=30)
         
+        # ⭐ FILTER: Only keep chunks from currently uploaded documents
+        if current_documents:
+            docs = [doc for doc in docs if doc.metadata.get('document') in current_documents]
+        
+        # If no docs found, try broader search
+        if len(docs) < 5 and current_documents:
+            all_docs = _vectorstore.similarity_search("main topics concepts key ideas", k=100)
+            docs = [doc for doc in all_docs if doc.metadata.get('document') in current_documents]
+        
+        # If still no docs, return generic questions
+        if not docs:
+            return [
+                "What are the main topics covered in your uploaded documents?",
+                "Explain the key concepts discussed",
+                "What are the important points mentioned?",
+            ]
+        
+        # Extract unique content samples
         content_samples = []
         seen_pages = set()
         
-        # Extract unique content samples (avoid duplicates)
         for doc in docs:
             page = doc.metadata.get('page', 0)
             doc_name = doc.metadata.get('document', 'Unknown')
@@ -337,15 +350,12 @@ def generate_suggested_questions(_vectorstore, num_questions=5):
                 content_samples.append(doc.page_content[:500])
                 seen_pages.add((doc_name, page))
         
-        # Combine content for AI analysis
         combined_content = "\n\n".join(content_samples[:5])
         
-        # Get LLM with higher temperature for creative questions
         llm = get_llm(0.7)
         if not llm:
             raise Exception("Failed to get LLM")
         
-        # Prompt for question generation
         prompt = f"""Based on the following document excerpts, generate {num_questions} interesting and diverse questions.
 
 Make the questions:
@@ -361,28 +371,23 @@ Generate exactly {num_questions} questions, one per line, without numbering:"""
 
         response = llm.invoke(prompt)
         
-        # Parse and clean response
         questions = [q.strip() for q in response.content.strip().split('\n') 
                     if q.strip() and not q.strip().startswith(('#', '-', '*', '1', '2', '3', '4', '5'))]
         
-        # Remove numbering artifacts
         cleaned_questions = []
         for q in questions:
             q = q.lstrip('0123456789.)')
             q = q.strip()
-            if q and len(q) > 10:  # Valid question check
+            if q and len(q) > 10:
                 cleaned_questions.append(q)
         
         return cleaned_questions[:num_questions]
         
     except Exception as e:
-        # Fallback to generic questions if generation fails
         return [
-            "What are the main topics covered in these documents?",
+            "What are the main topics covered in your documents?",
             "Explain the key concepts discussed",
-            "What are the important algorithms or methods described?",
-            "What are the time complexities mentioned?",
-            "How do the different approaches compare?"
+            "What are the important points mentioned?"
         ]
 
 # ============================================================================
@@ -957,6 +962,9 @@ with tab1:
         
         # Process button
         if uploaded_files:
+
+            st.session_state.current_uploaded_docs = [file.name for file in uploaded_files]
+
             if st.button("🚀 Process Documents", type="primary"):
                 add_documents(
                     uploaded_files,
@@ -976,7 +984,7 @@ with tab1:
             total_chunks = sum(s['chunks'] for s in st.session_state.processed_files.values())
             
             st.info(f"📊 **Total:** {len(st.session_state.processed_files)} docs, {total_pages} pages, {total_chunks} chunks")
-            
+        
             st.divider()
             
             # List each document with details and delete option
@@ -993,7 +1001,11 @@ with tab1:
                     with col2:
                         if st.button("🗑️", key=f"del_{filename}", help="Delete this document"):
                             remove_document(filename)
-                            st.rerun()
+                        # ⭐ Update current_uploaded_docs after deletion
+                        if hasattr(st.session_state, 'current_uploaded_docs'):
+                            if filename in st.session_state.current_uploaded_docs:
+                                st.session_state.current_uploaded_docs.remove(filename)
+                        st.rerun()
             
             st.divider()
             
@@ -1006,6 +1018,7 @@ with tab1:
                     st.session_state.all_documents = []
                     st.session_state.vectorstore = None
                     st.session_state.chat_history = []
+                    st.session_state.current_uploaded_docs = []
                     st.success("✅ All documents cleared")
                     st.rerun()
             
@@ -1148,7 +1161,13 @@ with tab1:
             
             with st.spinner("🤖 Generating intelligent questions..."):
                 try:
-                    suggested_questions = generate_suggested_questions(st.session_state.vectorstore)
+                    # ⭐ Pass the current documents list
+                    current_docs = getattr(st.session_state, 'current_uploaded_docs', None)
+                    suggested_questions = generate_suggested_questions(
+                        st.session_state.vectorstore,
+                        num_questions=5,
+                        current_documents=current_docs  # ⭐ THIS IS THE KEY FIX
+                    )
                 except Exception as e:
                     st.error(f"Failed to generate suggestions: {str(e)}")
                     suggested_questions = []
